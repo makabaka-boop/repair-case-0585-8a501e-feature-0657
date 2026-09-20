@@ -1,40 +1,25 @@
-"""Sliding-window dynamic program for satellite telemetry gap repair.
+"""Sliding-window dynamic programs for satellite telemetry gap repair.
 
-Problem
--------
-A gap of ``n`` positions ``[0, n)`` must be covered by back-to-back
-half-open segments ``[start, end)``. Every segment uses exactly one source
-(A or B). Choosing a segment of source ``s`` over ``[i, j)`` costs
+A gap of ``n`` positions ``[0, n)`` is covered by back-to-back half-open
+segments ``[start, end)``. Every segment uses source A or B. Choosing source
+``s`` for ``[i, j)`` costs
 
     fee[s] + sum(cost[k][s] for k in range(i, j))
 
-so the per-source activation fee is paid once *per segment* that uses the
-source. Consecutive segments of the same source are therefore never free:
-a new segment always pays the fee again.
+so the activation fee is paid once per segment, including when adjacent
+segments use the same source.
 
-Recurrence
-----------
-``dp[j]`` is the lexicographically best solution covering ``[0, j)``:
+The default objective compares candidates lexicographically by
+``(cost, segments, predecessor, source)``.
 
-    dp[0] = (cost=0, segments=0, prev=-1, source=-1)
-    dp[j] = min over source s in (A, B), i in [j-L, j-1], i >= 0
-            (dp[i].cost + fee[s] + prefix_s[j] - prefix_s[i],
-             dp[i].segments + 1, i, s)
+The ``continuity`` objective first keeps the minimum total cost. Among those
+plans it minimizes source changes (the first segment is not a change), then
+segment count, final-segment start, and final source. At each recurrence, a
+tie in these values uses the selected prefix's own continuity ordering. It is
+computed with separate A/B prefix states; the no-source sentinel is only used
+for a first segment and is never inserted into an A/B state window.
 
-Candidates are compared strictly in the order
-``(cost, segments, prev index, source)`` with source A < B, so the
-recurrence determines a unique plan; there is no arbitrary tie breaking.
-
-For a fixed source the innermost term is ``dp[i].cost - prefix_s[i]`` plus
-quantities independent of ``i``, and the feasible predecessors form the
-sliding window ``[j-L, j-1]``. Two monotonic deques maintain the minimum
-of
-
-    (dp[i].cost - prefix_s[i], dp[i].segments, i)
-
-over that window in O(1) amortised time per endpoint, giving O(n) time
-(which satisfies the O(n log n) requirement) and O(n) memory. No solver
-is invoked and the L possible starts of an endpoint are never enumerated.
+Both objectives use O(n) time and O(n) space.
 """
 
 from collections import deque
@@ -44,6 +29,11 @@ from dataclasses import dataclass
 SOURCE_A = 0
 SOURCE_B = 1
 SOURCE_NAMES = ("A", "B")
+
+OBJECTIVE_DEFAULT = "default"
+OBJECTIVE_CONTINUITY = "continuity"
+
+_NO_SOURCE = -1
 
 
 @dataclass(frozen=True)
@@ -65,23 +55,34 @@ class Solution:
 
 
 def solve(n: int, costs: list[tuple[int, int]], fee_a: int, fee_b: int,
-          max_len: int) -> Solution:
+          max_len: int, objective: str = OBJECTIVE_DEFAULT) -> Solution:
     """Compute the optimal cover of [0, n).
 
     ``costs[k]`` is the pair of per-position costs ``(cost of A, cost of
-    B)`` at position ``k``. All inputs are assumed already validated by the
-    API layer; the algorithm itself trusts the bounds.
+    B)`` at position ``k``. Inputs are assumed already validated by the API
+    layer; the algorithm itself trusts the bounds.
     """
-    fees = (fee_a, fee_b)
+    if objective == OBJECTIVE_CONTINUITY:
+        return _solve_continuity(n, costs, fee_a, fee_b, max_len)
+    return _solve_default(n, costs, fee_a, fee_b, max_len)
 
-    # Prefix sums per source: prefix_s[j] = sum of source-s costs on [0,j).
+
+def _prefix_sums(
+    n: int, costs: list[tuple[int, int]]
+) -> tuple[list[int], list[int]]:
     prefix_a = [0] * (n + 1)
     prefix_b = [0] * (n + 1)
     for k in range(n):
         a, b = costs[k]
         prefix_a[k + 1] = prefix_a[k] + a
         prefix_b[k + 1] = prefix_b[k] + b
-    prefixes = (prefix_a, prefix_b)
+    return prefix_a, prefix_b
+
+
+def _solve_default(n: int, costs: list[tuple[int, int]], fee_a: int,
+                   fee_b: int, max_len: int) -> Solution:
+    fees = (fee_a, fee_b)
+    prefixes = _prefix_sums(n, costs)
 
     # DP tables.
     best_cost = [0] * (n + 1)
@@ -89,22 +90,12 @@ def solve(n: int, costs: list[tuple[int, int]], fee_a: int, fee_b: int,
     prev_index = [-1] * (n + 1)
     prev_source = [-1] * (n + 1)
 
-    # One monotonic deque per source. Each entry is index i with key
-    # (best_cost[i] - prefix_s[i], best_seg_count[i], i). Keys along the
-    # deque are non-decreasing; equal keys keep the smaller index at the
-    # front (we only pop on strictly-greater keys), matching the
-    # predecessor-index tie breaker.
-    #
-    # Inserting i into deque s is only legal for endpoints j > i, so the
-    # seed i=0 is inserted before processing endpoint 1.
+    # Each entry in window s is an index i, keyed by
+    # (best_cost[i] - prefix_s[i], best_seg_count[i], i).
     windows: tuple[deque, deque] = (deque([0]), deque([0]))
 
     for j in range(1, n + 1):
-        low = j - max_len  # smallest predecessor still inside the window
-
-        # Evict indices that left the window [j-L, j-1]. The predecessor
-        # i == j-L is still feasible (segment of length exactly L), so only
-        # strictly smaller indices are removed.
+        low = j - max_len
         for window in windows:
             while window and window[0] < low:
                 window.popleft()
@@ -127,7 +118,6 @@ def solve(n: int, costs: list[tuple[int, int]], fee_a: int, fee_b: int,
         prev_index[j] = i
         prev_source[j] = s
 
-        # j becomes a feasible predecessor for endpoints j+1 .. j+L.
         for s, window in enumerate(windows):
             key = (best_cost[j] - prefixes[s][j], best_seg_count[j])
             while window:
@@ -136,21 +126,153 @@ def solve(n: int, costs: list[tuple[int, int]], fee_a: int, fee_b: int,
                     best_cost[tail] - prefixes[s][tail],
                     best_seg_count[tail],
                 )
-                # Strictly worse (greater key) tails are dominated forever;
-                # equal keys are kept because their smaller index must win
-                # the predecessor-index tie breaker and expires earlier.
+                # Equal keys retain the smaller/older index; it has the
+                # predecessor-index tie breaker and expires first.
                 if tail_key <= key:
                     break
                 window.pop()
             window.append(j)
 
-    # Reconstruct the unique optimal plan back to front.
-    segments: list[Segment] = []
-    j = n
-    while j > 0:
-        i = prev_index[j]
-        segments.append(Segment(i, j, SOURCE_NAMES[prev_source[j]]))
-        j = i
-    segments.reverse()
+    return _reconstruct(n, prev_index, prev_source, best_cost[n])
 
-    return Solution(cost=best_cost[n], segments=tuple(segments))
+
+def _solve_continuity(n: int, costs: list[tuple[int, int]], fee_a: int,
+                      fee_b: int, max_len: int) -> Solution:
+    fees = (fee_a, fee_b)
+    prefixes = _prefix_sums(n, costs)
+
+    # State p is the source of the last segment (0=A, 1=B). Arrays are
+    # indexed [p][j]. The empty prefix is not state A or B.
+    best_cost = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
+    switches = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
+    seg_count = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
+    last_start = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
+    full_keys = [[()] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
+    prev_index = [[-1] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
+    prev_state = [[_NO_SOURCE] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
+
+    # windows[p][s] contains state-p prefixes to which a source-s segment is
+    # appended. The two no-source rows hold only index 0 until it expires.
+    windows = tuple(
+        tuple(deque([0]) for _s in (SOURCE_A, SOURCE_B))
+        for _p in range(3)
+    )
+
+    for j in range(1, n + 1):
+        low = j - max_len
+        for row in windows:
+            for window in row:
+                while window and window[0] < low:
+                    window.popleft()
+
+        for s in (SOURCE_A, SOURCE_B):
+            best_candidate = None
+            chosen_predecessor = _NO_SOURCE
+            for p in range(3):
+                window = windows[p][s]
+                if not window:
+                    continue
+                i = window[0]
+                if p < 2:
+                    prefix_cost = best_cost[p][i]
+                    prefix_switches = switches[p][i]
+                    prefix_count = seg_count[p][i]
+                    # The new final source is fixed, so a tie in the visible
+                    # final-plan keys is resolved with the prefix's own full
+                    # continuity order.
+                    prefix_tie = full_keys[p][i]
+                    predecessor_state = p
+                    added_switch = 0 if p == s else 1
+                else:
+                    prefix_cost = 0
+                    prefix_switches = 0
+                    prefix_count = 0
+                    prefix_tie = ()
+                    predecessor_state = _NO_SOURCE
+                    added_switch = 0
+
+                candidate = (
+                    prefix_cost - prefixes[s][i] + prefixes[s][j] + fees[s],
+                    prefix_switches + added_switch,
+                    prefix_count + 1,
+                    i,
+                    s,
+                    prefix_tie,
+                )
+                if best_candidate is None or candidate < best_candidate:
+                    best_candidate = candidate
+                    chosen_predecessor = predecessor_state
+
+            cost, switch_count, count, i, s, _prefix_tie = best_candidate
+            best_cost[s][j] = cost
+            switches[s][j] = switch_count
+            seg_count[s][j] = count
+            last_start[s][j] = i
+            full_keys[s][j] = best_candidate
+            prev_index[s][j] = i
+            prev_state[s][j] = chosen_predecessor
+
+            # A real A/B prefix becomes a predecessor only in windows keyed
+            # by its actual last-source state.
+            for new_s, window in enumerate(windows[s]):
+                key = (
+                    best_cost[s][j] - prefixes[new_s][j],
+                    switches[s][j],
+                    seg_count[s][j],
+                )
+                while window:
+                    tail = window[-1]
+                    tail_key = (
+                        best_cost[s][tail] - prefixes[new_s][tail],
+                        switches[s][tail],
+                        seg_count[s][tail],
+                    )
+                    if tail_key <= key:
+                        break
+                    window.pop()
+                window.append(j)
+
+    final_candidate = None
+    final_state = SOURCE_A
+    for p in (SOURCE_A, SOURCE_B):
+        candidate = (
+            best_cost[p][n],
+            switches[p][n],
+            seg_count[p][n],
+            last_start[p][n],
+            p,
+        )
+        if final_candidate is None or candidate < final_candidate:
+            final_candidate = candidate
+            final_state = p
+
+    return _reconstruct_states(
+        n, prev_index, prev_state, final_state, final_candidate[0])
+
+
+def _reconstruct(n: int, prev_index: list[int], prev_source: list[int],
+                 total_cost: int) -> Solution:
+    segments: list[Segment] = []
+    end = n
+    while end > 0:
+        start = prev_index[end]
+        segments.append(Segment(start, end, SOURCE_NAMES[prev_source[end]]))
+        end = start
+    segments.reverse()
+    return Solution(cost=total_cost, segments=tuple(segments))
+
+
+def _reconstruct_states(n: int, prev_index: list[list[int]],
+                        prev_state: list[list[int]], final_state: int,
+                        total_cost: int) -> Solution:
+    segments: list[Segment] = []
+    end = n
+    state = final_state
+    while end > 0:
+        start = prev_index[state][end]
+        segments.append(Segment(start, end, SOURCE_NAMES[state]))
+        next_state = prev_state[state][end]
+        end = start
+        state = next_state
+    segments.reverse()
+    return Solution(cost=total_cost, segments=tuple(segments))
