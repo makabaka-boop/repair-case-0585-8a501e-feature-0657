@@ -1,4 +1,4 @@
-"""Sliding-window dynamic program for satellite telemetry gap repair.
+"""Sliding-window dynamic programs for satellite telemetry gap repair.
 
 Problem
 -------
@@ -12,18 +12,29 @@ so the per-source activation fee is paid once *per segment* that uses the
 source. Consecutive segments of the same source are therefore never free:
 a new segment always pays the fee again.
 
-Recurrence
-----------
+Two objectives share the cost model:
+
+``default``
+    The lexicographic order is
+    ``(cost, segments, predecessor index, source)`` with source A < B.
+
+``continuity``
+    Cost is still minimized first; among minimum-cost plans the solver then
+    minimizes, in order, the number of adjacent source switches (the first
+    segment does not count as a switch), the segment count, the start of
+    the last segment and the source of the last segment (A < B). Prefix
+    plans are adjudicated by the same order recursively: when two plans
+    covering the same endpoint are tied through their last segment, their
+    common-length prefixes are compared in that order.
+
+Default recurrence
+------------------
 ``dp[j]`` is the lexicographically best solution covering ``[0, j)``:
 
     dp[0] = (cost=0, segments=0, prev=-1, source=-1)
     dp[j] = min over source s in (A, B), i in [j-L, j-1], i >= 0
             (dp[i].cost + fee[s] + prefix_s[j] - prefix_s[i],
              dp[i].segments + 1, i, s)
-
-Candidates are compared strictly in the order
-``(cost, segments, prev index, source)`` with source A < B, so the
-recurrence determines a unique plan; there is no arbitrary tie breaking.
 
 For a fixed source the innermost term is ``dp[i].cost - prefix_s[i]`` plus
 quantities independent of ``i``, and the feasible predecessors form the
@@ -32,9 +43,48 @@ of
 
     (dp[i].cost - prefix_s[i], dp[i].segments, i)
 
-over that window in O(1) amortised time per endpoint, giving O(n) time
-(which satisfies the O(n log n) requirement) and O(n) memory. No solver
-is invoked and the L possible starts of an endpoint are never enumerated.
+over that window in O(1) amortised time per endpoint.
+
+Continuity recurrence
+---------------------
+The continuity mode keeps, per endpoint ``j``, one best prefix per source
+of its last segment: ``dp[j][p]`` for ``p in (A, B)``. A source-less
+sentinel ``dp[0] = (0, 0, 0)`` (cost, switches, segments) seeds first
+segments; it is never stored in a window and a first segment never pays a
+switch.
+
+For a new segment of source ``s`` extending prefix ``(i, p)`` the switch
+indicator is ``p != s``; it only shifts the switch component by a
+per-deque constant (0 or 1) and therefore does not affect the monotonic
+window ordering. Windows are maintained per (previous source, new source)
+pair ``(p, s)`` over the constant-independent key
+
+    (dp[i][p].cost - prefix_s[i],
+     dp[i][p].switches,
+     dp[i][p].segments)
+
+and the candidate ending at ``j`` is compared as
+
+    (cost, switches + (p != s), segments + 1, predecessor i, prefix rank)
+
+where the *prefix rank* is the predecessor plan adjudicated in the very
+same continuity order,
+``(dp[i][p].cost, dp[i][p].switches, dp[i][p].segments,
+   dp[i][p].prev, p)``. It is only consulted when cost, switches,
+segments and the last-segment start all tie (which forces equal
+predecessor indices); the first-segment candidate carries the rank of
+the empty prefix. Note the window key's switch term already includes
+the new edge, so two equal-looking candidates may rest on prefixes with
+different switch counts -- the prefix rank, not the edge-adjusted
+value, performs the recursive tie break. At the final endpoint the
+last comparison component is the candidate's own last source instead,
+implementing the "last segment source" tie breaker.
+
+Both modes run in O(n) time and O(n) memory: every index enters and
+leaves each deque at most once. The continuity tables and deques are
+disjoint from the default mode's state; backtracking only reads the mode
+that was solved, so continuity can never rewrite a prefix the default
+mode had discarded, and default tie results are unchanged.
 """
 
 from collections import deque
@@ -44,6 +94,14 @@ from dataclasses import dataclass
 SOURCE_A = 0
 SOURCE_B = 1
 SOURCE_NAMES = ("A", "B")
+
+# Objectives.
+OBJECTIVE_DEFAULT = "default"
+OBJECTIVE_CONTINUITY = "continuity"
+OBJECTIVES = (OBJECTIVE_DEFAULT, OBJECTIVE_CONTINUITY)
+
+# Source-less predecessor of every first segment.
+NO_SOURCE = -1
 
 
 @dataclass(frozen=True)
@@ -65,22 +123,35 @@ class Solution:
 
 
 def solve(n: int, costs: list[tuple[int, int]], fee_a: int, fee_b: int,
-          max_len: int) -> Solution:
+          max_len: int, objective: str = OBJECTIVE_DEFAULT) -> Solution:
     """Compute the optimal cover of [0, n).
 
     ``costs[k]`` is the pair of per-position costs ``(cost of A, cost of
     B)`` at position ``k``. All inputs are assumed already validated by the
-    API layer; the algorithm itself trusts the bounds.
+    API layer; the algorithm itself trusts the bounds. ``objective`` is
+    either ``"default"`` or ``"continuity"``.
     """
-    fees = (fee_a, fee_b)
+    if objective == OBJECTIVE_CONTINUITY:
+        return _solve_continuity(n, costs, fee_a, fee_b, max_len)
+    return _solve_default(n, costs, fee_a, fee_b, max_len)
 
-    # Prefix sums per source: prefix_s[j] = sum of source-s costs on [0,j).
+
+def _prefix_sums(n, costs):
     prefix_a = [0] * (n + 1)
     prefix_b = [0] * (n + 1)
     for k in range(n):
         a, b = costs[k]
         prefix_a[k + 1] = prefix_a[k] + a
         prefix_b[k + 1] = prefix_b[k] + b
+    return prefix_a, prefix_b
+
+
+def _solve_default(n: int, costs: list[tuple[int, int]], fee_a: int,
+                   fee_b: int, max_len: int) -> Solution:
+    fees = (fee_a, fee_b)
+
+    # Prefix sums per source: prefix_s[j] = sum of source-s costs on [0,j).
+    prefix_a, prefix_b = _prefix_sums(n, costs)
     prefixes = (prefix_a, prefix_b)
 
     # DP tables.
@@ -154,3 +225,137 @@ def solve(n: int, costs: list[tuple[int, int]], fee_a: int, fee_b: int,
     segments.reverse()
 
     return Solution(cost=best_cost[n], segments=tuple(segments))
+
+
+def _solve_continuity(n: int, costs: list[tuple[int, int]], fee_a: int,
+                      fee_b: int, max_len: int) -> Solution:
+    """Minimize (cost, switches, segments, last start, last source).
+
+    Tables are flat, index ``2*j + p`` holding the best prefix covering
+    ``[0, j)`` whose last segment uses source ``p``.
+    """
+    fees = (fee_a, fee_b)
+    prefix_a, prefix_b = _prefix_sums(n, costs)
+    prefixes = (prefix_a, prefix_b)
+
+    size = 2 * (n + 1)
+    best_cost = [0] * size
+    switches = [0] * size
+    seg_count = [0] * size
+    prev_index = [-1] * size
+    prev_source = [-1] * size
+
+    # windows[p][s]: monotonic deque of indices i whose best prefix ends in
+    # source p and which may be extended by a new segment of source s.
+    # Entry key (the (p != s) switch edge is a per-deque constant and is
+    # left out):
+    #   (best_cost[i][p] - prefix_s[i], switches[i][p], seg_count[i][p])
+    # Keys are non-decreasing; equal keys keep the smaller index at the
+    # front (last-segment-start tie breaker), as in the default mode.
+    #
+    # The source-less sentinel i=0 is never inserted: first segments are
+    # offered as explicit candidates while j <= L.
+    windows = ((deque(), deque()), (deque(), deque()))
+
+    for j in range(1, n + 1):
+        low = j - max_len
+        for p in (SOURCE_A, SOURCE_B):
+            for s in (SOURCE_A, SOURCE_B):
+                window = windows[p][s]
+                while window and window[0] < low:
+                    window.popleft()
+
+        for s in (SOURCE_A, SOURCE_B):
+            # First-segment candidate from the source-less sentinel; its
+            # prefix rank is the empty prefix (0, 0, 0, -1, -1). i == 0
+            # only occurs here, since index 0 is never enqueued, so it can
+            # never tie against a window candidate on
+            # (..., i, prefix rank).
+            best_candidate = None
+            if j <= max_len:
+                best_candidate = (
+                    prefixes[s][j] + fees[s],
+                    0,  # first segment pays no switch
+                    1,
+                    0,
+                    (0, 0, 0, NO_SOURCE, NO_SOURCE),
+                )
+
+            for p in (SOURCE_A, SOURCE_B):
+                window = windows[p][s]
+                if not window:
+                    continue
+                i = window[0]
+                k = 2 * i + p
+                candidate = (
+                    best_cost[k] - prefixes[s][i] + prefixes[s][j]
+                    + fees[s],
+                    switches[k] + (1 if p != s else 0),
+                    seg_count[k] + 1,
+                    i,
+                    (best_cost[k], switches[k], seg_count[k],
+                     prev_index[k], p),
+                )
+                if best_candidate is None or candidate < best_candidate:
+                    best_candidate = candidate
+
+            cost, sw, count, i, rank = best_candidate
+            # The predecessor source is the last component of the prefix
+            # rank (NO_SOURCE for the sentinel); do not read the stale
+            # candidate-loop variable p.
+            p = rank[-1]
+            out = 2 * j + s
+            best_cost[out] = cost
+            switches[out] = sw
+            seg_count[out] = count
+            prev_index[out] = i
+            prev_source[out] = p
+
+        # State (j, s) becomes a feasible predecessor for endpoints
+        # j+1 .. j+L under a following segment of either source.
+        for p in (SOURCE_A, SOURCE_B):
+            k = 2 * j + p
+            for s in (SOURCE_A, SOURCE_B):
+                window = windows[p][s]
+                key = (
+                    best_cost[k] - prefixes[s][j],
+                    switches[k],
+                    seg_count[k],
+                )
+                while window:
+                    tail = window[-1]
+                    tk = 2 * tail + p
+                    tail_key = (
+                        best_cost[tk] - prefixes[s][tail],
+                        switches[tk],
+                        seg_count[tk],
+                    )
+                    # Equal keys stay: the smaller index wins the
+                    # last-segment-start tie breaker and expires earlier.
+                    if tail_key <= key:
+                        break
+                    window.pop()
+                window.append(j)
+
+    # Final adjudication: the last comparison component is the plan's own
+    # last source (A < B), not its predecessor's source.
+    final_candidates = []
+    for p in (SOURCE_A, SOURCE_B):
+        k = 2 * n + p
+        final_candidates.append(
+            (best_cost[k], switches[k], seg_count[k], prev_index[k], p))
+    cost, _, _, _, last_source = min(final_candidates)
+
+    # Backtrack exclusively through continuity-mode state.
+    segments: list[Segment] = []
+    j = n
+    p = last_source
+    while j > 0:
+        k = 2 * j + p
+        i = prev_index[k]
+        segments.append(Segment(i, j, SOURCE_NAMES[p]))
+        p = prev_source[k]
+        j = i
+    segments.reverse()
+
+    return Solution(cost=cost, segments=tuple(segments))

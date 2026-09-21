@@ -1,8 +1,9 @@
 """Request/response models.
 
 Validation here is what produces HTTP 422 for bad length, out-of-range
-values or an illegal L. On any such error FastAPI returns only the
-standard ``detail`` payload: no cost and no (partial) segment list.
+values, an illegal L or objective, or a bad type. On any such error
+FastAPI returns only the standard ``detail`` payload: no cost and no
+(partial) segment list.
 """
 
 from typing import Literal
@@ -10,6 +11,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, StrictInt, model_validator
 
 SourceName = Literal["A", "B"]
+ObjectiveName = Literal["default", "continuity"]
 
 
 class PositionCost(BaseModel):
@@ -23,6 +25,10 @@ class GapRequest(BaseModel):
     fee_a: StrictInt = Field(ge=0, le=1_000_000)
     fee_b: StrictInt = Field(ge=0, le=1_000_000)
     costs: list[PositionCost] = Field(min_length=1, max_length=200_000)
+    # Omitted or "default": the historical (cost, segments, prev, source)
+    # order. "continuity": (cost, switches, segments, last start, last
+    # source). Any other string is rejected here with the same 422 payload.
+    objective: ObjectiveName = "default"
 
     @model_validator(mode="after")
     def _costs_must_match_n(self) -> "GapRequest":

@@ -336,3 +336,372 @@ def test_api_validation_errors_422(payload):
 
 def test_health():
     assert client.get("/health").json() == {"status": "ok"}
+
+
+# --------------------------------------------------------------------------
+# continuity objective: exhaustive oracle, locked case, references
+# --------------------------------------------------------------------------
+
+
+def enumerate_plans(n, max_len):
+    """Every legal cover of [0, n) as ((start, end, source_id), ...).
+
+    Enumerates all admissible cut positions and both sources per segment.
+    """
+
+    def rec(start, acc):
+        for end in range(start + 1, min(start + max_len, n) + 1):
+            for s in (SOURCE_A, SOURCE_B):
+                acc.append((start, end, s))
+                if end == n:
+                    yield tuple(acc)
+                else:
+                    yield from rec(end, acc)
+                acc.pop()
+
+    yield from rec(0, [])
+
+
+def _adjudication_keys(plan, costs, fees, objective):
+    """Prefix adjudication tuples at every endpoint, newest first.
+
+    Comparing two plans by this reversed list reproduces the recursive
+    "ties defer to the prefix in the same order" rule for each objective.
+    """
+    pref = [[0], [0]]
+    for a, b in costs:
+        pref[0].append(pref[0][-1] + a)
+        pref[1].append(pref[1][-1] + b)
+    keys = []
+    total = 0
+    for idx, (a, b, s) in enumerate(plan, start=1):
+        total += fees[s] + pref[s][b] - pref[s][a]
+        if objective == "default":
+            keys.append((total, idx, a, s))
+        else:
+            switches = sum(
+                1 for t in range(1, idx) if plan[t][2] != plan[t - 1][2])
+            keys.append((total, switches, idx, a, s))
+    return keys[::-1]
+
+
+def objective_oracle(n, costs, fee_a, fee_b, max_len, objective):
+    """Brute force over every segmentation and source assignment."""
+    fees = (fee_a, fee_b)
+    best_keys = None
+    best_plan = None
+    for plan in enumerate_plans(n, max_len):
+        keys = _adjudication_keys(plan, costs, fees, objective)
+        if best_keys is None or keys < best_keys:
+            best_keys, best_plan = keys, plan
+    cost = best_keys[::-1][-1][0]
+    return cost, [(a, b, "AB"[s]) for a, b, s in best_plan]
+
+
+def continuity_reference_naive(n, costs, fee_a, fee_b, max_len):
+    """Independent O(nL) continuity DP with full recursive prefix ranks."""
+    fees = (fee_a, fee_b)
+    pref = [[0] * (n + 1) for _ in range(2)]
+    for k in range(n):
+        pref[0][k + 1] = pref[0][k] + costs[k][0]
+        pref[1][k + 1] = pref[1][k] + costs[k][1]
+
+    EMPTY = (0, 0, 0, -1, -1)
+    # state 2*j+p: best prefix ending in p covering [0,j)
+    cost = [0] * (2 * (n + 1))
+    switch = [0] * (2 * (n + 1))
+    count = [0] * (2 * (n + 1))
+    prev = [-1] * (2 * (n + 1))
+    pprev = [-1] * (2 * (n + 1))
+    reachable = [False] * (2 * (n + 1))
+
+    for j in range(1, n + 1):
+        for s in (SOURCE_A, SOURCE_B):
+            best = None
+            if j <= max_len:
+                best = (pref[s][j] + fees[s], 0, 1, 0, EMPTY)
+            for i in range(max(0, j - max_len), j):
+                for p in (SOURCE_A, SOURCE_B):
+                    k = 2 * i + p
+                    if not reachable[k] and i != 0:
+                        continue
+                    if i == 0:
+                        continue
+                    rank = (cost[k], switch[k], count[k], prev[k], p)
+                    cand = (
+                        cost[k] + fees[s] + pref[s][j] - pref[s][i],
+                        switch[k] + (1 if p != s else 0),
+                        count[k] + 1,
+                        i,
+                        rank,
+                    )
+                    if best is None or cand < best:
+                        best = cand
+            c, w, m, i, rank = best
+            out = 2 * j + s
+            cost[out], switch[out], count[out] = c, w, m
+            prev[out], pprev[out] = i, rank[-1]
+            reachable[out] = True
+
+    finals = [
+        (cost[2 * n + s], switch[2 * n + s], count[2 * n + s],
+         prev[2 * n + s], s)
+        for s in (SOURCE_A, SOURCE_B)
+    ]
+    c, _, _, _, last = min(finals)
+    segs = []
+    j, p = n, last
+    while j > 0:
+        k = 2 * j + p
+        segs.append((prev[k], j, "AB"[p]))
+        p = pprev[k]
+        j = prev[k]
+    segs.reverse()
+    return c, segs
+
+
+def continuity_reference_heap(n, costs, fee_a, fee_b, max_len):
+    """Independent O(n log n) continuity DP with lazy expiry heaps."""
+    import heapq
+
+    fees = (fee_a, fee_b)
+    pref = [[0] * (n + 1) for _ in range(2)]
+    for k in range(n):
+        pref[0][k + 1] = pref[0][k] + costs[k][0]
+        pref[1][k + 1] = pref[1][k] + costs[k][1]
+
+    size = 2 * (n + 1)
+    costs_arr = [0] * size
+    sw_arr = [0] * size
+    counts = [0] * size
+    prev_i = [-1] * size
+    prev_p = [-1] * size
+    heaps = [[[] for _ in (SOURCE_A, SOURCE_B)] for _ in (SOURCE_A, SOURCE_B)]
+
+    EMPTY = (0, 0, 0, -1, -1)
+    for j in range(1, n + 1):
+        low = j - max_len
+        for s in (SOURCE_A, SOURCE_B):
+            best = None
+            if j <= max_len:
+                best = (pref[s][j] + fees[s], 0, 1, 0, EMPTY)
+            for p in (SOURCE_A, SOURCE_B):
+                heap = heaps[p][s]
+                while heap and heap[0][3] < low:
+                    heapq.heappop(heap)
+                if not heap:
+                    continue
+                _val, _sw, _cnt, i = heap[0]
+                k = 2 * i + p
+                cand = (
+                    costs_arr[k] + fees[s] + pref[s][j] - pref[s][i],
+                    sw_arr[k] + (1 if p != s else 0),
+                    counts[k] + 1,
+                    i,
+                    (costs_arr[k], sw_arr[k], counts[k], prev_i[k], p),
+                )
+                if best is None or cand < best:
+                    best = cand
+            c, w, m, i, rank = best
+            out = 2 * j + s
+            costs_arr[out], sw_arr[out], counts[out] = c, w, m
+            prev_i[out], prev_p[out] = i, rank[-1]
+        for p in (SOURCE_A, SOURCE_B):
+            out = 2 * j + p
+            for s in (SOURCE_A, SOURCE_B):
+                heapq.heappush(
+                    heaps[p][s],
+                    (costs_arr[out] - pref[s][j], sw_arr[out],
+                     counts[out], j))
+
+    finals = [
+        (costs_arr[2 * n + s], sw_arr[2 * n + s], counts[2 * n + s],
+         prev_i[2 * n + s], s)
+        for s in (SOURCE_A, SOURCE_B)
+    ]
+    c, _, _, _, last = min(finals)
+    segs = []
+    j, p = n, last
+    while j > 0:
+        k = 2 * j + p
+        segs.append((prev_i[k], j, "AB"[p]))
+        p = prev_p[k]
+        j = prev_i[k]
+    segs.reverse()
+    return c, segs
+
+
+def _seg_tuples(solution):
+    return [(s.start, s.end, s.source) for s in solution.segments]
+
+
+@pytest.mark.parametrize("n", range(1, 10))
+def test_continuity_matches_exhaustive_segmentation_oracle(n):
+    # Enumerate every legal segmentation with every A/B assignment under
+    # tie-heavy costs/fees; the solver must reproduce the full recursive
+    # adjudication exactly.
+    rng = random.Random(7000 + n)
+    for trial in range(12):
+        L = rng.randrange(1, n + 1)
+        flavor = rng.random()
+        if flavor < 0.4:
+            costs = [(0, 0)] * n
+        elif flavor < 0.8:
+            costs = [(rng.choice((0, 1)), rng.choice((0, 1)))
+                     for _ in range(n)]
+        else:
+            costs = [(rng.randrange(0, 4), rng.randrange(0, 4))
+                     for _ in range(n)]
+        fa = rng.choice((0, 0, 1, 4))
+        fb = rng.choice((0, 0, 1, 4))
+        for objective in ("default", "continuity"):
+            sol = solve(n, costs, fa, fb, L, objective)
+            ocost, osegs = objective_oracle(
+                n, costs, fa, fb, L, objective)
+            assert sol.cost == ocost
+            assert _seg_tuples(sol) == osegs
+            assert_plan_valid(sol.segments, n, L, costs, (fa, fb), sol.cost)
+
+
+def test_locked_n3_L1_zero_costs_switch_pattern():
+    n, L = 3, 1
+    costs = [(0, 0), (1, 0), (0, 1)]
+    default_plan = solve(n, costs, 0, 0, L)
+    continuity_plan = solve(n, costs, 0, 0, L, "continuity")
+    # Default (cost, segments, prev, source): A beats B at every position.
+    assert default_plan.cost == 0
+    assert _seg_tuples(default_plan) == [
+        (0, 1, "A"), (1, 2, "B"), (2, 3, "A")]
+    # Continuity: minimum cost 0; one switch beats two, and the switch
+    # lands at the latest break with the final source equal to A: BBA.
+    assert continuity_plan.cost == 0
+    assert _seg_tuples(continuity_plan) == [
+        (0, 1, "B"), (1, 2, "B"), (2, 3, "A")]
+
+
+def test_continuity_against_naive_reference_medium():
+    rng = random.Random(31337)
+    for _ in range(40):
+        n = rng.randrange(10, 70)
+        L = rng.randrange(1, min(n, 14) + 1)
+        costs = [(rng.randrange(0, 100), rng.randrange(0, 100))
+                 for _ in range(n)]
+        fa, fb = rng.randrange(0, 60), rng.randrange(0, 60)
+        sol = solve(n, costs, fa, fb, L, "continuity")
+        rc, rs = continuity_reference_naive(n, costs, fa, fb, L)
+        assert sol.cost == rc
+        assert _seg_tuples(sol) == rs
+        assert_plan_valid(sol.segments, n, L, costs, (fa, fb), sol.cost)
+
+
+def test_continuity_small_L_max_scale_matches_naive():
+    n, L = 200_000, 3
+    rng = random.Random(31338)
+    costs = [(rng.randrange(0, 1_000_001), rng.randrange(0, 1_000_001))
+             for _ in range(n)]
+    fa, fb = 500_000, 500_000
+    sol = solve(n, costs, fa, fb, L, "continuity")
+    rc, rs = continuity_reference_naive(n, costs, fa, fb, L)
+    assert sol.cost == rc
+    assert _seg_tuples(sol) == rs
+    assert_plan_valid(sol.segments, n, L, costs, (fa, fb), sol.cost)
+
+
+def test_continuity_max_scale_performance_and_heap_reference():
+    n, L = 200_000, 4096
+    rng = random.Random(31339)
+    costs = [(rng.randrange(0, 1_000_001), rng.randrange(0, 1_000_001))
+             for _ in range(n)]
+    fa, fb = rng.randrange(0, 1_000_001), rng.randrange(0, 1_000_001)
+
+    t0 = time.perf_counter()
+    sol = solve(n, costs, fa, fb, L, "continuity")
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 10.0  # O(n), same budget as the default max-scale case
+    assert_plan_valid(sol.segments, n, L, costs, (fa, fb), sol.cost)
+
+    rc, rs = continuity_reference_heap(n, costs, fa, fb, L)
+    assert sol.cost == rc
+    assert _seg_tuples(sol) == rs
+
+    # Continuity minimizes cost first: its minimum total cost cannot be
+    # below the default objective's minimum cost (same feasible set).
+    default_sol = solve(n, costs, fa, fb, L, "default")
+    assert default_sol.cost == sol.cost
+
+
+# --------------------------------------------------------------------------
+# objective on the API: legality, 422 shape, default compatibility
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_objective", [
+    "fastest", "DEFAULT", "Default", " continuity", "continuity ",
+    "", "min-cost", 3, True, None,
+])
+def test_api_illegal_objective_422(bad_objective):
+    payload = _payload(objective=bad_objective)
+    resp = client.post("/solve", json=payload)
+    assert resp.status_code == 422
+    body = resp.json()
+    # Only the standard validation payload; never a partial plan.
+    assert set(body) == {"detail"}
+    assert "cost" not in body and "segments" not in body
+    assert body["detail"][0]["loc"][-1] == "objective"
+
+
+def test_api_explicit_default_matches_omitted():
+    omitted = client.post("/solve", json=_payload())
+    explicit = client.post("/solve", json=_payload(objective="default"))
+    assert omitted.status_code == explicit.status_code == 200
+    assert omitted.json() == explicit.json()
+
+
+def test_api_default_compatibility_matches_oracle_random():
+    rng = random.Random(8080)
+    for _ in range(12):
+        n = rng.randrange(1, 40)
+        L = rng.randrange(1, n + 1)
+        fa, fb = rng.randrange(0, 50), rng.randrange(0, 50)
+        costs = [(rng.randrange(0, 100), rng.randrange(0, 100))
+                 for _ in range(n)]
+        payload = {
+            "n": n,
+            "L": L,
+            "fee_a": fa,
+            "fee_b": fb,
+            "costs": [{"a": a, "b": b} for a, b in costs],
+        }
+        omitted = client.post("/solve", json=payload)
+        explicit = client.post("/solve", json={**payload, "objective": "default"})
+        continuity = client.post("/solve", json={**payload, "objective": "continuity"})
+        assert omitted.status_code == explicit.status_code == 200
+        assert omitted.json() == explicit.json()
+        ocost, osegs = oracle(n, costs, fa, fb, L)
+        assert omitted.json()["cost"] == ocost
+        assert [(s["start"], s["end"], s["source"])
+                for s in omitted.json()["segments"]] == osegs
+        assert continuity.status_code == 200
+        assert set(continuity.json()) == {"cost", "segments"}
+        assert continuity.json()["cost"] == ocost
+
+
+def test_api_continuity_locked_case():
+    n, L = 3, 1
+    costs = [(0, 0), (1, 0), (0, 1)]
+    payload = {
+        "n": n, "L": L, "fee_a": 0, "fee_b": 0,
+        "costs": [{"a": a, "b": b} for a, b in costs],
+    }
+    default_resp = client.post("/solve", json=payload)
+    continuity_resp = client.post("/solve", json={**payload, "objective": "continuity"})
+    assert default_resp.json()["segments"] == [
+        {"start": 0, "end": 1, "source": "A"},
+        {"start": 1, "end": 2, "source": "B"},
+        {"start": 2, "end": 3, "source": "A"},
+    ]
+    assert continuity_resp.json()["segments"] == [
+        {"start": 0, "end": 1, "source": "B"},
+        {"start": 1, "end": 2, "source": "B"},
+        {"start": 2, "end": 3, "source": "A"},
+    ]

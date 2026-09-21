@@ -24,6 +24,7 @@ def solve_gap(req: GapRequest) -> GapResponse:
         fee_a=req.fee_a,
         fee_b=req.fee_b,
         max_len=req.L,
+        objective=req.objective,
     )
     return GapResponse(
         cost=result.cost,
